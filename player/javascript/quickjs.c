@@ -464,7 +464,7 @@ static int get_obj_properties(void *ta_ctx, JSContext *ctx, JSValueConst obj,
     *keys = talloc_array(ta_ctx, char *, len);
     for (uint32_t i = 0; i < len; i++) {
         const char *name = JS_AtomToCString(ctx, props[i].atom);
-        *keys[i] = talloc_strdup(ta_ctx, name);
+        (*keys)[i] = talloc_strdup(ta_ctx, name);
         JS_FreeCString(ctx, name);
     }
     JS_FreePropertyEnum(ctx, props, len);
@@ -497,10 +497,18 @@ static int js_to_node(void *ta_ctx, mpv_node *dst, JSContext *ctx,
         dst->u.int64 = i;
         return 0;
     }
-    case JS_TAG_FLOAT64:
-        dst->format = MPV_FORMAT_DOUBLE;
-        dst->u.double_ = JS_VALUE_GET_FLOAT64(val);
+    case JS_TAG_FLOAT64: {
+        double d = JS_VALUE_GET_FLOAT64(val);
+        // Convert to INT64 if possible (like MuJS does)
+        if (d >= INT64_MIN && d <= (double)INT64_MAX && d == (int64_t)d) {
+            dst->format = MPV_FORMAT_INT64;
+            dst->u.int64 = (int64_t)d;
+        } else {
+            dst->format = MPV_FORMAT_DOUBLE;
+            dst->u.double_ = d;
+        }
         return 0;
+    }
     case JS_TAG_STRING: {
         const char *s = JS_ToCString(ctx, val);
         if (!s)
@@ -594,7 +602,6 @@ static JSValue js_set_property_native(JSContext *ctx, JSValueConst this_val,
     }
     int r = mpv_set_property(jclient(ctx), name, MPV_FORMAT_NODE, &node);
     JS_FreeCString(ctx, name);
-    mpv_free_node_contents(&node);
     talloc_free(af);
     return push_status(ctx, r);
 }
@@ -732,14 +739,12 @@ static JSValue js_command_native(JSContext *ctx, JSValueConst this_val,
     JSValue ret;
     if (r < 0) {
         pushed_error(ctx, r, def, &ret);
-        mpv_free_node_contents(&cmd);
         talloc_free(af);
         return ret;
     } else {
         ret = node_to_js(ctx, &result);
     }
     mpv_free_node_contents(&result);
-    mpv_free_node_contents(&cmd);
     talloc_free(af);
     return ret;
 }
