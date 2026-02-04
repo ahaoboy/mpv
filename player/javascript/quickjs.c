@@ -144,6 +144,88 @@ static const char *get_builtin_file(const char *name) {
     return NULL;
 }
 
+static JSModuleDef *mp_js_module_loader(JSContext *ctx, const char *module_name,
+                                     void *opaque) {
+    JSModuleDef *m = NULL;
+    JSValue func_val = JS_UNDEFINED;
+
+    if (get_builtin_file(module_name)) {
+        JS_ThrowReferenceError(ctx, "builtin modules not supported");
+        goto out;
+    }
+
+    void *af = talloc_new(NULL);
+    char *filename = mp_get_user_path(af, jctx(ctx)->mpctx->global, module_name);
+    MP_VERBOSE(jctx(ctx), "Loading module '%s'\n", filename);
+
+    int flags = STREAM_READ_FILE_FLAGS_DEFAULT | STREAM_ALLOW_PARTIAL_READ |
+                STREAM_SILENT;
+    bstr data = stream_read_file2(filename, af, flags, jctx(ctx)->mpctx->global,
+                                  INT_MAX - 1);
+    if (!data.start) {
+        JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
+                               module_name);
+        talloc_free(af);
+        goto out;
+    }
+
+    func_val = JS_Eval(ctx, data.start, data.len, module_name,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    talloc_free(af);
+
+    if (JS_IsException(func_val))
+        goto out;
+    /* the module is already referenced, so we must free it */
+    m = JS_VALUE_GET_PTR(func_val);
+    JS_FreeValue(ctx, func_val);
+
+out:
+    return m;
+}
+
+static char *mp_js_module_normalize(JSContext *ctx, const char *module_base_name,
+                                 const char *module_name, void *opaque) {
+    char *ret = NULL;
+    char *path = NULL;
+    void *af = talloc_new(NULL);
+
+    if (module_name[0] != '.') {
+        // Not relative: return as is (absolute path or generic name)
+        ret = strdup(module_name);
+        goto out;
+    }
+
+    struct script_ctx *sctx = opaque;
+
+    // Relative path: resolve against base
+    bstr dir = mp_dirname(module_base_name);
+    char *base_dir = talloc_strndup(af, dir.start, dir.len);
+
+    // mp_path_join allocates on the parent context (af), result is valid until af free
+    path = mp_path_join(af, base_dir, module_name);
+
+    // Resolve to absolute path using mp_get_user_path (handles ~/, relative to config, etc)
+    char *abs_path = mp_get_user_path(af, sctx->mpctx->global, path);
+    if (!abs_path) abs_path = path; // fallback if resolution fails (unlikely)
+
+    // Check if file exists, or try adding .js
+    struct stat st;
+    if (stat(abs_path, &st) != 0) {
+        char *path_js = talloc_asprintf(af, "%s.js", abs_path);
+        if (stat(path_js, &st) == 0) {
+            ret = strdup(path_js);
+            goto out;
+        }
+    }
+
+    // Return resolved path (even if not found, loader will error)
+    ret = strdup(abs_path);
+
+out:
+    talloc_free(af);
+    return ret;
+}
+
 static JSValue read_file_limit(JSContext *ctx, const char *fname, int limit) {
     void *af = talloc_new(NULL);
     JSValue ret = JS_UNDEFINED;
@@ -1231,23 +1313,33 @@ static int run_script(JSContext *ctx, struct script_ctx *sctx) {
     const char *def = builtin_files[0][1];
     r = eval_string(ctx, def, "@/defaults.js");
     if (JS_IsException(r)) {
+        MP_VERBOSE(sctx, "Failed to load defaults.js\n");
         goto error;
     }
     JS_FreeValue(ctx, r);
 
     JSValue main_code = read_file_limit(ctx, sctx->filename, -1);
     if (JS_IsException(main_code)) {
+        MP_VERBOSE(sctx, "Failed to read main script\n");
         goto error;
     }
 
     size_t len;
     const char *src = JS_ToCStringLen(ctx, &len, main_code);
-    r = JS_Eval(ctx, src, len, sctx->filename, JS_EVAL_TYPE_GLOBAL);
+
+    int eval_flags = JS_EVAL_TYPE_GLOBAL;
+    // Simple heuristic to detect if the script is a module
+    if (strstr(src, "import ") || strstr(src, "export ")) {
+        eval_flags = JS_EVAL_TYPE_MODULE;
+    }
+
+    r = JS_Eval(ctx, src, len, sctx->filename, eval_flags);
     JS_FreeCString(ctx, src);
     JS_FreeValue(ctx, main_code);
     if (JS_IsException(r)) {
         goto error;
     }
+
     JS_FreeValue(ctx, r);
 
     JSValue global = JS_GetGlobalObject(ctx);
@@ -1255,6 +1347,7 @@ static int run_script(JSContext *ctx, struct script_ctx *sctx) {
     if (!JS_IsFunction(ctx, fn)) {
         JS_FreeValue(ctx, fn);
         JS_FreeValue(ctx, global);
+        set_last_error(sctx, 1, "no event loop function");
         return -1;
     }
     r = JS_Call(ctx, fn, global, 0, NULL);
@@ -1269,8 +1362,36 @@ error: {
     JSValue exc = JS_GetException(ctx);
     JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
     const char *str = JS_ToCString(ctx, JS_IsUndefined(stack) ? exc : stack);
-    set_last_error(sctx, 1, str ? str : "unknown error");
-    JS_FreeCString(ctx, str);
+
+    // Fallback if stack/str is empty or generic
+    if (!str || strcmp(str, "Error") == 0 || str[0] == '\0') {
+         if (str) JS_FreeCString(ctx, str);
+         // Try to get message and name specifically
+         JSValue msg = JS_GetPropertyStr(ctx, exc, "message");
+         JSValue name = JS_GetPropertyStr(ctx, exc, "name");
+         const char *msg_s = JS_ToCString(ctx, msg);
+         const char *name_s = JS_ToCString(ctx, name);
+
+         const char *exc_str = JS_ToCString(ctx, exc);
+
+         char *full_err = talloc_asprintf(NULL, "%s: %s (%s)",
+              name_s ? name_s : "Unknown",
+              msg_s ? msg_s : "No message",
+              exc_str ? exc_str : "obj");
+
+         set_last_error(sctx, 1, full_err);
+         talloc_free(full_err);
+
+         JS_FreeCString(ctx, msg_s);
+         JS_FreeCString(ctx, name_s);
+         JS_FreeCString(ctx, exc_str);
+         JS_FreeValue(ctx, msg);
+         JS_FreeValue(ctx, name);
+    } else {
+         set_last_error(sctx, 1, str);
+         JS_FreeCString(ctx, str);
+    }
+
     JS_FreeValue(ctx, stack);
     JS_FreeValue(ctx, exc);
 }
@@ -1300,6 +1421,7 @@ static int load_quickjs(struct mp_script_args *args) {
         goto error_out;
 
     JS_SetContextOpaque(ctx->qctx, ctx);
+    JS_SetModuleLoaderFunc(ctx->rt, mp_js_module_normalize, mp_js_module_loader, ctx);
 
     set_last_error(ctx, 0, NULL);
 
