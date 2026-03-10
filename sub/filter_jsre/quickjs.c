@@ -47,17 +47,14 @@ static char *get_err(struct sd_filter *ft, JSContext *ctx) {
 static int test_any(struct priv *p, const char *text, int *match_index) {
     JSContext *ctx = p->ctx;
 
-    JSValue args[2] = {JS_DupValue(ctx, p->regexes), JS_NewString(ctx, text)};
-    if (JS_IsException(args[0]) || JS_IsException(args[1])) {
-        JS_FreeValue(ctx, args[0]);
-        JS_FreeValue(ctx, args[1]);
+    JSValue text_val = JS_NewString(ctx, text);
+    if (JS_IsException(text_val))
         return 1;
-    }
 
+    JSValue args[2] = {p->regexes, text_val};
     JSValue ret =
         JS_Call(ctx, p->test_fn, JS_UNDEFINED, MP_ARRAY_SIZE(args), args);
-    JS_FreeValue(ctx, args[1]);
-    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, text_val);
     if (JS_IsException(ret))
         return 1;
 
@@ -209,6 +206,7 @@ static struct demux_packet *jsre_filter(struct sd_filter *ft,
         talloc_free(msg);
     }
 
+    talloc_free(text);
     return drop ? NULL : pkt;
 }
 

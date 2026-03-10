@@ -114,16 +114,23 @@ static double js_to_number(JSContext *ctx, JSValueConst v) {
 
 static int64_t js_to_int64_checked(JSContext *ctx, JSValueConst v, int idx) {
     double d = js_to_number(ctx, v);
+    if (isnan(d))
+        return 0; // js_to_number already set an exception
     if (!(d >= INT64_MIN && d <= (double)INT64_MAX)) {
         JS_ThrowRangeError(ctx, "int out of range at index %d", idx);
+        return 0;
     }
     return (int64_t)d;
 }
 
 static uint64_t js_to_uint64_checked(JSContext *ctx, JSValueConst v, int idx) {
     double d = js_to_number(ctx, v);
-    if (!(d >= 0 && d <= (double)UINT64_MAX))
+    if (isnan(d))
+        return 0;
+    if (!(d >= 0 && d <= (double)UINT64_MAX)) {
         JS_ThrowRangeError(ctx, "uint64 out of range at index %d", idx);
+        return 0;
+    }
     return (uint64_t)d;
 }
 
@@ -264,10 +271,13 @@ static JSValue js_log(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "log requires level");
     const char *level = js_to_cstring(ctx, argv[0]);
+    if (!level)
+        return JS_EXCEPTION;
     int msgl = mp_msg_find_level(level);
     if (msgl < 0) {
+        JSValue err = JS_ThrowRangeError(ctx, "Invalid log level '%s'", level);
         JS_FreeCString(ctx, level);
-        return JS_ThrowRangeError(ctx, "Invalid log level '%s'", level);
+        return err;
     }
 
     struct mp_log *log = jctx(ctx)->log;
@@ -312,6 +322,8 @@ static JSValue js_command(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "command expects a string");
     const char *cmd = js_to_cstring(ctx, argv[0]);
+    if (!cmd)
+        return JS_EXCEPTION;
     int r = mpv_command_string(jclient(ctx), cmd);
     JS_FreeCString(ctx, cmd);
     return push_status(ctx, r);
@@ -324,8 +336,14 @@ static JSValue js_commandv(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc >= MP_ARRAY_SIZE(cargv))
         return JS_ThrowRangeError(ctx, "Too many arguments");
 
-    for (int i = 0; i < argc; i++)
+    for (int i = 0; i < argc; i++) {
         cargv[i] = js_to_cstring(ctx, argv[i]);
+        if (!cargv[i]) {
+            for (int j = 0; j < i; j++)
+                JS_FreeCString(ctx, cargv[j]);
+            return JS_EXCEPTION;
+        }
+    }
     cargv[argc] = NULL;
     int r = mpv_command(jclient(ctx), cargv);
     for (int i = 0; i < argc; i++)
@@ -339,7 +357,13 @@ static JSValue js_set_property(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "set_property expects name, value");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     const char *val = js_to_cstring(ctx, argv[1]);
+    if (!val) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
     int r = mpv_set_property_string(jclient(ctx), name, val);
     JS_FreeCString(ctx, name);
     JS_FreeCString(ctx, val);
@@ -352,6 +376,8 @@ static JSValue js_set_property_bool(JSContext *ctx, JSValueConst this_val,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "set_property_bool expects 2 args");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     int v = js_is_truthy(ctx, argv[1]);
     int r = mpv_set_property(jclient(ctx), name, MPV_FORMAT_FLAG, &v);
     JS_FreeCString(ctx, name);
@@ -364,6 +390,8 @@ static JSValue js_set_property_number(JSContext *ctx, JSValueConst this_val,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "set_property_number expects 2 args");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     int tag = JS_VALUE_GET_NORM_TAG(argv[1]);
     mpv_handle *h = jclient(ctx);
     int r;
@@ -414,6 +442,8 @@ static JSValue js_get_property(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "get_property expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     JSValue def = argc >= 2 ? argv[1] : JS_UNDEFINED;
     JSValue ret = js_get_property_string(ctx, name, def);
     JS_FreeCString(ctx, name);
@@ -426,6 +456,8 @@ static JSValue js_get_property_bool(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "get_property_bool expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     JSValue def = argc >= 2 ? argv[1] : JS_UNDEFINED;
     int result = 0;
     int r = mpv_get_property(jclient(ctx), name, MPV_FORMAT_FLAG, &result);
@@ -444,6 +476,8 @@ static JSValue js_get_property_number(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "get_property_number expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     JSValue def = argc >= 2 ? argv[1] : JS_UNDEFINED;
     double result = 0;
     int r = mpv_get_property(jclient(ctx), name, MPV_FORMAT_DOUBLE, &result);
@@ -462,6 +496,8 @@ static JSValue js_del_property(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "del_property expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     int r = mpv_del_property(jclient(ctx), name);
     JS_FreeCString(ctx, name);
     return push_status(ctx, r);
@@ -663,7 +699,13 @@ static int js_to_node(void *ta_ctx, mpv_node *dst, JSContext *ctx,
         return 0;
     }
     default: {
-        return -1;
+        const char *s = JS_ToCString(ctx, val);
+        if (!s)
+            return -1;
+        dst->format = MPV_FORMAT_STRING;
+        dst->u.string = talloc_strdup(ta_ctx, s);
+        JS_FreeCString(ctx, s);
+        return 0;
     }
     }
 }
@@ -675,6 +717,8 @@ static JSValue js_set_property_native(JSContext *ctx, JSValueConst this_val,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "set_property_native expects 2 args");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     void *af = talloc_new(NULL);
     mpv_node node = {0};
     if (js_to_node(af, &node, ctx, argv[1]) < 0) {
@@ -694,6 +738,8 @@ static JSValue js_get_property_native(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "get_property_native expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     JSValue def = argc >= 2 ? argv[1] : JS_UNDEFINED;
     void *af = talloc_new(NULL);
     mpv_node node = {0};
@@ -719,6 +765,8 @@ static JSValue js_get_property_osd(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "get_property_osd expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     JSValue def = argc >= 2 ? argv[1] : JS_UNDEFINED;
     char *res = NULL;
     int r = mpv_get_property(jclient(ctx), name, MPV_FORMAT_OSD_STRING, &res);
@@ -743,6 +791,8 @@ static JSValue js_request_event(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "_request_event expects name, enable");
     const char *event = js_to_cstring(ctx, argv[0]);
+    if (!event)
+        return JS_EXCEPTION;
     bool enable = js_is_truthy(ctx, argv[1]);
 
     for (int n = 0; n < 256; n++) {
@@ -763,10 +813,13 @@ static JSValue js_enable_messages(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "enable_messages expects level");
     const char *level = js_to_cstring(ctx, argv[0]);
+    if (!level)
+        return JS_EXCEPTION;
     int r = mpv_request_log_messages(jclient(ctx), level);
     if (r == MPV_ERROR_INVALID_PARAMETER) {
+        JSValue err = JS_ThrowRangeError(ctx, "Invalid log level '%s'", level);
         JS_FreeCString(ctx, level);
-        return JS_ThrowRangeError(ctx, "Invalid log level '%s'", level);
+        return err;
     }
     JS_FreeCString(ctx, level);
     return push_status(ctx, r);
@@ -784,6 +837,8 @@ static JSValue js_observe_property(JSContext *ctx, JSValueConst this_val,
                              MPV_FORMAT_STRING, MPV_FORMAT_DOUBLE};
     uint64_t id = js_to_uint64_checked(ctx, argv[0], 1);
     const char *name = js_to_cstring(ctx, argv[1]);
+    if (!name)
+        return JS_EXCEPTION;
     int fidx = checkopt(ctx, argv[2], "none", fmts, "observe type");
     if (fidx < 0) {
         JS_FreeCString(ctx, name);
@@ -919,6 +974,8 @@ static JSValue js_hook_add(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 3)
         return JS_ThrowTypeError(ctx, "_hook_add expects name, pri, id");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     int pri = js_to_int64_checked(ctx, argv[1], 2);
     uint64_t id = js_to_uint64_checked(ctx, argv[2], 3);
     int r = mpv_hook_add(jclient(ctx), id, name, pri);
@@ -992,6 +1049,8 @@ static JSValue js_file_info(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "file_info expects path");
     const char *path = js_to_cstring(ctx, argv[0]);
+    if (!path)
+        return JS_EXCEPTION;
     struct stat st;
     if (stat(path, &st) != 0) {
         JS_FreeCString(ctx, path);
@@ -1018,6 +1077,8 @@ static JSValue js_split_path(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "split_path expects path");
     const char *p = js_to_cstring(ctx, argv[0]);
+    if (!p)
+        return JS_EXCEPTION;
     bstr dir = mp_dirname(p);
     JSValue arr = JS_NewArray(ctx);
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewStringLen(ctx, dir.start, dir.len));
@@ -1032,7 +1093,13 @@ static JSValue js_join_path(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "join_path expects 2 args");
     const char *a = js_to_cstring(ctx, argv[0]);
+    if (!a)
+        return JS_EXCEPTION;
     const char *b = js_to_cstring(ctx, argv[1]);
+    if (!b) {
+        JS_FreeCString(ctx, a);
+        return JS_EXCEPTION;
+    }
     void *tmp = talloc_new(NULL);
     char *joined = mp_path_join(tmp, a, b);
     JSValue ret = JS_NewString(ctx, joined);
@@ -1050,7 +1117,13 @@ static JSValue js_write_file(JSContext *ctx, JSValueConst this_val, int argc,
     }
     bool append = js_is_truthy(ctx, argv[0]);
     const char *fname_js = js_to_cstring(ctx, argv[1]);
+    if (!fname_js)
+        return JS_EXCEPTION;
     const char *data_js = js_to_cstring(ctx, argv[2]);
+    if (!data_js) {
+        JS_FreeCString(ctx, fname_js);
+        return JS_EXCEPTION;
+    }
     static const char *prefix = "file://";
     const char *opstr = append ? "append" : "write";
     if (strstr(fname_js, prefix) != fname_js) {
@@ -1067,9 +1140,10 @@ static JSValue js_write_file(JSContext *ctx, JSValueConst this_val, int argc,
     FILE *f = fopen(fname, append ? "ab" : "wb");
     if (!f) {
         JS_FreeCString(ctx, data_js);
+        JSValue err = JS_ThrowInternalError(ctx, "Cannot open (%s) file: '%s'",
+                                            opstr, fname);
         talloc_free(fname);
-        return JS_ThrowInternalError(ctx, "Cannot open (%s) file: '%s'", opstr,
-                                     fname);
+        return err;
     }
 
     int len = strlen(data_js);
@@ -1094,6 +1168,8 @@ static JSValue js_read_file(JSContext *ctx, JSValueConst this_val, int argc,
         limit = (int)js_to_int64_checked(ctx, argv[1], 2);
     }
     const char *fname = js_to_cstring(ctx, argv[0]);
+    if (!fname)
+        return JS_EXCEPTION;
     JSValue ret = read_file_limit(ctx, fname, limit);
     JS_FreeCString(ctx, fname);
     return ret;
@@ -1105,6 +1181,8 @@ static JSValue js_getenv(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "getenv expects name");
     const char *name = js_to_cstring(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
     const char *v = getenv(name);
     JS_FreeCString(ctx, name);
     if (v)
@@ -1175,6 +1253,8 @@ static JSValue js_find_config_file(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "find_config_file expects name");
     const char *fname = js_to_cstring(ctx, argv[0]);
+    if (!fname)
+        return JS_EXCEPTION;
     char *path = mp_find_config_file(NULL, jctx(ctx)->mpctx->global, fname);
     JS_FreeCString(ctx, fname);
     if (path) {
@@ -1197,6 +1277,8 @@ static JSValue js_set_last_error(JSContext *ctx, JSValueConst this_val,
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "_set_last_error expects string");
     const char *e = js_to_cstring(ctx, argv[0]);
+    if (!e)
+        return JS_EXCEPTION;
     set_last_error(jctx(ctx), e[0], e);
     JS_FreeCString(ctx, e);
     return JS_UNDEFINED;
